@@ -1,0 +1,30 @@
+{
+    "name": "terraform-api",
+    "version": "1.0.0",
+    "description": "API server for executing Terraform commands with enhanced bucket management",
+    "main": "terraform-api-server.js",
+    "scripts": {
+      "start": "node terraform-api-server.js",
+      "dev": "nodemon terraform-api-server.js",
+      "test": "echo \"Error: no test specified\" && exit 1"
+    },
+    "keywords": [
+      "terraform",
+      "api",
+      "infrastructure",
+      "aws",
+      "s3"
+    ],
+    "author": "",
+    "license": "ISC",
+    "dependencies": {
+      "@aws-sdk/client-s3": "^3.350.0",
+      "body-parser": "^1.20.1",
+      "cors": "^2.8.5",
+      "express": "^4.18.2",
+      "crypto": "^1.0.1"
+    },
+    "devDependencies": {
+      "nodemon": "^2.0.20"
+    }
+  }
