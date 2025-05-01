@@ -417,7 +417,7 @@ resource "aws_codepipeline_webhook" "github_webhook" {
   target_pipeline = aws_codepipeline.pipeline.name
 
   authentication_configuration {
-    secret_token = var.webhook_secret
+    secret_token = local.actual_webhook_secret
   }
 
   filter {
@@ -450,3 +450,11 @@ resource "aws_codestarconnections_connection" "github" {
   provider_type = "GitHub"
 }
 
+resource "random_password" "webhook_secret" {
+  length  = 32
+  special = false
+}
+
+locals {
+  actual_webhook_secret = var.webhook_secret != "" ? var.webhook_secret : random_password.webhook_secret.result
+}
