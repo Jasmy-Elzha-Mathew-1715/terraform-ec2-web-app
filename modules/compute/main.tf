@@ -2,58 +2,28 @@
 # EC2 INSTANCE RESOURCES FOR WEB APPLICATION
 ###############################################
 
-# Security group for the backend EC2 instance
-resource "aws_security_group" "backend_sg" {
-  name        = "${var.project_name}-backend-sg"
-  description = "Security group for backend Node.js app"
+# Security group for the web application EC2 instance
+resource "aws_security_group" "web_app_sg" {
+  name        = "${var.project_name}-web-app-sg"
+  description = "Security group for web app (Node.js backend + Angular frontend)"
   vpc_id      = var.vpc_id
 
-  # Allow HTTP from ALB
-  ingress {
-    from_port       = 3000
-    to_port         = 3000
-    protocol        = "tcp"
-    security_groups = [aws_security_group.alb_sg.id]
-    description     = "Allow HTTP from ALB"
-  }
-
-  # Allow SSH access
-  ingress {
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = var.admin_cidr_blocks
-    description = "Allow SSH from admin IPs"
-  }
-
-  # Allow all outbound traffic
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-    description = "Allow all outbound traffic"
-  }
-
-  tags = {
-    Name        = "${var.project_name}-backend-sg"
-    Environment = var.environment
-  }
-}
-
-# Security group for the frontend EC2 instance
-resource "aws_security_group" "frontend_sg" {
-  name        = "${var.project_name}-frontend-sg"
-  description = "Security group for frontend Angular/Nginx"
-  vpc_id      = var.vpc_id
-
-  # Allow HTTP from ALB
+  # Allow HTTP from ALB (frontend)
   ingress {
     from_port       = 80
     to_port         = 80
     protocol        = "tcp"
     security_groups = [aws_security_group.alb_sg.id]
-    description     = "Allow HTTP from ALB"
+    description     = "Allow HTTP from ALB for frontend"
+  }
+
+  # Allow Node.js backend port from ALB
+  ingress {
+    from_port       = 3000
+    to_port         = 3000
+    protocol        = "tcp"
+    security_groups = [aws_security_group.alb_sg.id]
+    description     = "Allow backend API access from ALB"
   }
 
   # Allow SSH access
@@ -75,7 +45,7 @@ resource "aws_security_group" "frontend_sg" {
   }
 
   tags = {
-    Name        = "${var.project_name}-frontend-sg"
+    Name        = "${var.project_name}-web-app-sg"
     Environment = var.environment
   }
 }
@@ -188,74 +158,28 @@ resource "aws_iam_role_policy" "ec2_policy" {
   })
 }
 
-# Backend EC2 instance (Node.js)
-resource "aws_instance" "backend" {
+# Single EC2 instance hosting both Node.js backend and Angular frontend
+resource "aws_instance" "web_app" {
   ami                    = "ami-0f88e80871fd81e91"
-  instance_type          = var.backend_instance_type
+  instance_type          = var.instance_type
   subnet_id              = var.public_subnet_ids[0]
-  vpc_security_group_ids = [aws_security_group.backend_sg.id]
+  vpc_security_group_ids = [aws_security_group.web_app_sg.id]
   key_name               = var.key_name
   iam_instance_profile   = aws_iam_instance_profile.ec2_profile.name
 
   user_data = <<-EOF
     #!/bin/bash
-    echo "Setting up Node.js backend server"
-    # Install dependencies
+    echo "Setting up full-stack web application server"
+    
+    # Install system dependencies
+    apt-get update
+    apt-get install -y nginx git build-essential
+
+    # Install Node.js 16.x
     curl -sL https://deb.nodesource.com/setup_16.x | sudo -E bash -
-    apt-get update
-    apt-get install -y nodejs git
+    apt-get install -y nodejs
 
-    # Setup CodeDeploy agent
-    apt-get install -y ruby wget
-    cd /home/ubuntu
-    wget https://aws-codedeploy-${var.aws_region}.s3.amazonaws.com/latest/install
-    chmod +x ./install
-    ./install auto
-    service codedeploy-agent start
-    
-    echo "Node.js backend setup completed"
-  EOF
-
-  tags = {
-    Name        = "${var.project_name}-backend"
-    Environment = var.environment
-    Role        = "backend"
-  }
-
-  # Ensure proper termination settings
-  root_block_device {
-    volume_type           = "gp2"
-    volume_size           = 20
-    delete_on_termination = true
-  }
-
-  volume_tags = {
-    Name        = "${var.project_name}-backend-volume"
-    Environment = var.environment
-  }
-
-  lifecycle {
-    create_before_destroy = true
-  }
-}
-
-# Frontend EC2 instance (Angular Nginx)
-resource "aws_instance" "frontend" {
-  ami                    = var.frontend_ami_id
-  instance_type          = var.frontend_instance_type
-  subnet_id              = var.public_subnet_ids[1]
-  vpc_security_group_ids = [aws_security_group.frontend_sg.id]
-  key_name               = var.key_name
-  iam_instance_profile   = aws_iam_instance_profile.ec2_profile.name
-
-  user_data = <<-EOF
-    #!/bin/bash
-    echo "Setting up Angular frontend server with Nginx"
-    # Install dependencies
-    apt-get update
-    apt-get install -y nginx
-    
-    # Configure Nginx
+    # Configure Nginx for Angular frontend and Node.js backend proxy
     cat <<'NGINX_CONF' > /etc/nginx/sites-available/default
     server {
         listen 80 default_server;
@@ -266,24 +190,36 @@ resource "aws_instance" "frontend" {
 
         server_name _;
 
+        # Serve Angular frontend
         location / {
-            try_files $uri $uri/ /index.html;
+            try_files $$uri $$uri/ /index.html;
         }
 
+        # Proxy API requests to Node.js backend
         location /api/ {
-            proxy_pass http://${aws_instance.backend.private_ip}:3000/;
+            proxy_pass http://localhost:3000/api/;
             proxy_http_version 1.1;
-            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Upgrade $$http_upgrade;
             proxy_set_header Connection 'upgrade';
-            proxy_set_header Host $host;
-            proxy_cache_bypass $http_upgrade;
+            proxy_set_header Host $$host;
+            proxy_set_header X-Real-IP $$remote_addr;
+            proxy_set_header X-Forwarded-For $$proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $$scheme;
+            proxy_cache_bypass $$http_upgrade;
+        }
+
+        # Health check endpoint for ALB
+        location /health {
+            proxy_pass http://localhost:3000/health;
+            proxy_http_version 1.1;
+            proxy_set_header Host $$host;
         }
     }
     NGINX_CONF
 
-    # Setup NodeJS for Angular build support
-    curl -sL https://deb.nodesource.com/setup_16.x | sudo -E bash -
-    apt-get install -y nodejs git
+    # Create application directory
+    mkdir -p /opt/webapp
+    chown ubuntu:ubuntu /opt/webapp
 
     # Setup CodeDeploy agent
     apt-get install -y ruby wget
@@ -292,28 +228,79 @@ resource "aws_instance" "frontend" {
     chmod +x ./install
     ./install auto
     service codedeploy-agent start
-    
-    # Restart Nginx to apply configuration
+
+    # Create systemd service for Node.js backend
+    cat <<'SERVICE_CONF' > /etc/systemd/system/webapp-backend.service
+    [Unit]
+    Description=Node.js Web Application Backend
+    After=network.target
+
+    [Service]
+    Type=simple
+    User=ubuntu
+    WorkingDirectory=/opt/webapp
+    ExecStart=/usr/bin/node server.js
+    Restart=on-failure
+    Environment=NODE_ENV=production
+    Environment=PORT=3000
+
+    [Install]
+    WantedBy=multi-user.target
+    SERVICE_CONF
+
+    # Enable and start services
+    systemctl daemon-reload
+    systemctl enable nginx
+    systemctl enable webapp-backend
     systemctl restart nginx
     
-    echo "Angular/Nginx frontend setup completed"
+    # Create a placeholder health endpoint
+    mkdir -p /opt/webapp
+    cat <<'HEALTH_JS' > /opt/webapp/server.js
+    const express = require('express');
+    const app = express();
+    const port = 3000;
+
+    app.get('/health', (req, res) => {
+      res.json({ status: 'ok', message: 'Backend is running' });
+    });
+
+    app.get('/api/health', (req, res) => {
+      res.json({ status: 'ok', message: 'API is running' });
+    });
+
+    app.listen(port, () => {
+      console.log('Backend server running on port ' + port);
+    });
+    HEALTH_JS
+
+    # Install basic Express for health check
+    cd /opt/webapp
+    npm init -y
+    npm install express
+    chown -R ubuntu:ubuntu /opt/webapp
+
+    # Start the backend service
+    systemctl start webapp-backend
+    
+    echo "Full-stack web application setup completed"
   EOF
 
   tags = {
-    Name        = "${var.project_name}-frontend"
+    Name        = "${var.project_name}-web-app"
     Environment = var.environment
-    Role        = "frontend"
+    Role        = "fullstack"
   }
 
   # Ensure proper termination settings
   root_block_device {
     volume_type           = "gp2"
-    volume_size           = 20
+    volume_size           = 30
     delete_on_termination = true
   }
 
   volume_tags = {
-    Name        = "${var.project_name}-frontend-volume"
+    Name        = "${var.project_name}-web-app-volume"
     Environment = var.environment
   }
 
@@ -338,31 +325,7 @@ resource "aws_lb" "web_alb" {
   }
 }
 
-# Target group for backend
-resource "aws_lb_target_group" "backend_tg" {
-  name     = "${var.project_name}-backend-tg"
-  port     = 3000
-  protocol = "HTTP"
-  vpc_id   = var.vpc_id
-
-  health_check {
-    enabled             = true
-    interval            = 30
-    path                = "/health"
-    port                = "traffic-port"
-    healthy_threshold   = 3
-    unhealthy_threshold = 3
-    timeout             = 5
-    matcher             = "200"
-  }
-
-  tags = {
-    Name        = "${var.project_name}-backend-tg"
-    Environment = var.environment
-  }
-}
-
-# Target group for frontend
+# Target group for frontend (port 80)
 resource "aws_lb_target_group" "frontend_tg" {
   name     = "${var.project_name}-frontend-tg"
   port     = 80
@@ -386,17 +349,41 @@ resource "aws_lb_target_group" "frontend_tg" {
   }
 }
 
-# Attach backend instance to backend target group
-resource "aws_lb_target_group_attachment" "backend_attachment" {
-  target_group_arn = aws_lb_target_group.backend_tg.arn
-  target_id        = aws_instance.backend.id
-  port             = 3000
+# Target group for backend API (port 3000 via nginx proxy)
+resource "aws_lb_target_group" "backend_tg" {
+  name     = "${var.project_name}-backend-tg"
+  port     = 80
+  protocol = "HTTP"
+  vpc_id   = var.vpc_id
+
+  health_check {
+    enabled             = true
+    interval            = 30
+    path                = "/health"
+    port                = "traffic-port"
+    healthy_threshold   = 3
+    unhealthy_threshold = 3
+    timeout             = 5
+    matcher             = "200"
+  }
+
+  tags = {
+    Name        = "${var.project_name}-backend-tg"
+    Environment = var.environment
+  }
 }
 
-# Attach frontend instance to frontend target group
+# Attach web app instance to frontend target group
 resource "aws_lb_target_group_attachment" "frontend_attachment" {
   target_group_arn = aws_lb_target_group.frontend_tg.arn
-  target_id        = aws_instance.frontend.id
+  target_id        = aws_instance.web_app.id
+  port             = 80
+}
+
+# Attach web app instance to backend target group
+resource "aws_lb_target_group_attachment" "backend_attachment" {
+  target_group_arn = aws_lb_target_group.backend_tg.arn
+  target_id        = aws_instance.web_app.id
   port             = 80
 }
 
@@ -424,54 +411,7 @@ resource "aws_lb_listener_rule" "api_rule" {
 
   condition {
     path_pattern {
-      values = ["/api/*"]
+      values = ["/api/*", "/health"]
     }
   }
 }
-
-resource "aws_lb" "main" {
-  name               = "${var.project_name}-${var.environment}-alb"
-  internal           = false
-  load_balancer_type = "application"
-  security_groups    = [aws_security_group.alb.id]
-  subnets            = var.public_subnet_ids
-
-  enable_deletion_protection = false
-
-  tags = {
-    Name = "${var.project_name}-${var.environment}-alb"
-  }
-}
-
-resource "aws_security_group" "alb" {
-  name        = "${var.project_name}-${var.environment}-alb-sg"
-  description = "Allow inbound traffic to ALB"
-  vpc_id      = var.vpc_id
-
-  ingress {
-    from_port   = 80
-    to_port     = 80
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  ingress {
-    from_port   = 443
-    to_port     = 443
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  tags = {
-    Name = "${var.project_name}-${var.environment}-alb-sg"
-  }
-}
-
-

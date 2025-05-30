@@ -25,85 +25,162 @@ const s3Region = process.env.AWS_REGION || 'us-east-1';
 // AWS S3 Client
 const s3Client = new S3Client({ region: s3Region });
 
-// Single S3 bucket for all templates
-let s3BucketName = null;
-
-// Keep track of all created buckets
+// Track template-specific buckets
+const templateBuckets = new Map(); // templateName -> bucketName
 const createdBuckets = new Set();
 
 // Middleware
 app.use(cors());
 app.use(bodyParser.json());
 
-// Generate a unique bucket name
-function generateBucketName() {
-  const timestamp = Date.now();
-  const randomString = crypto.randomBytes(4).toString('hex');
-  return `terraform-temp-${timestamp}-${randomString}`;
+// Generate a predictable bucket name based on template
+function generateTemplateBucketName(templateName, environment = 'dev') {
+  // Create a consistent hash for the template
+  const hash = crypto.createHash('md5').update(`${templateName}-${environment}`).digest('hex').substring(0, 8);
+  return `terraform-state-${templateName}-${environment}-${hash}`;
 }
 
-// Find all temporary buckets created by this API
-async function findAllTemporaryBuckets() {
+// Parse Terraform output to get actual bucket name
+function parseTerraformOutput(output) {
+  try {
+    // Look for bucket name in terraform output
+    const bucketMatch = output.match(/terraform_state_bucket\s*=\s*"([^"]+)"/);
+    if (bucketMatch) {
+      return bucketMatch[1];
+    }
+    
+    // Alternative patterns
+    const altMatch = output.match(/bucket[^=]*=\s*"([^"]+)"/i);
+    if (altMatch) {
+      return altMatch[1];
+    }
+    
+    return null;
+  } catch (error) {
+    console.error('Error parsing terraform output:', error);
+    return null;
+  }
+}
+
+// Get or create bucket for template
+async function getTemplateBucket(templateName, environment = 'dev') {
+  // Check if we already have a bucket for this template
+  if (templateBuckets.has(templateName)) {
+    const bucketName = templateBuckets.get(templateName);
+    try {
+      await s3Client.send(new HeadBucketCommand({ Bucket: bucketName }));
+      return bucketName;
+    } catch (error) {
+      console.log(`Bucket ${bucketName} no longer exists, will create new one`);
+      templateBuckets.delete(templateName);
+    }
+  }
+  
+  // Generate predictable bucket name
+  const bucketName = generateTemplateBucketName(templateName, environment);
+  
+  try {
+    // Check if bucket exists
+    await s3Client.send(new HeadBucketCommand({ Bucket: bucketName }));
+    console.log(`Found existing bucket: ${bucketName}`);
+  } catch (error) {
+    if (error.name === 'NotFound' || error.name === 'NoSuchBucket') {
+      // Create the bucket
+      console.log(`Creating bucket: ${bucketName}`);
+      await s3Client.send(new CreateBucketCommand({
+        Bucket: bucketName,
+        CreateBucketConfiguration: s3Region !== 'us-east-1' ? { LocationConstraint: s3Region } : undefined
+      }));
+      console.log(`Successfully created bucket: ${bucketName}`);
+    } else {
+      throw error;
+    }
+  }
+  
+  // Track the bucket
+  templateBuckets.set(templateName, bucketName);
+  createdBuckets.add(bucketName);
+  
+  return bucketName;
+}
+
+// Find all terraform-related buckets
+async function findAllTerraformBuckets() {
   try {
     const { Buckets } = await s3Client.send(new ListBucketsCommand({}));
     if (!Buckets || Buckets.length === 0) {
       return [];
     }
     
-    const tempBuckets = Buckets.filter(bucket => 
-      bucket.Name.startsWith('terraform-temp-') || 
-      bucket.Name.startsWith('terraform-state-')
+    const terraformBuckets = Buckets.filter(bucket => 
+      bucket.Name.startsWith('terraform-state-') || 
+      bucket.Name.startsWith('terraform-temp-')
     );
     
-    return tempBuckets.map(bucket => bucket.Name);
+    return terraformBuckets.map(bucket => bucket.Name);
   } catch (error) {
-    console.error('Error finding temporary buckets:', error);
+    console.error('Error finding terraform buckets:', error);
     return [];
   }
 }
 
-// Clean up all temporary buckets
+// Clean up bucket contents and delete bucket
+async function cleanupBucket(bucketName) {
+  try {
+    console.log(`Cleaning up bucket: ${bucketName}`);
+    
+    // List and delete all objects
+    const { Contents } = await s3Client.send(new ListObjectsV2Command({ Bucket: bucketName }));
+    
+    if (Contents && Contents.length > 0) {
+      for (const obj of Contents) {
+        await s3Client.send(new DeleteObjectCommand({ 
+          Bucket: bucketName, 
+          Key: obj.Key 
+        }));
+        console.log(`Deleted object ${obj.Key} from bucket ${bucketName}`);
+      }
+    }
+    
+    // Delete the bucket
+    await s3Client.send(new DeleteBucketCommand({ Bucket: bucketName }));
+    console.log(`Successfully deleted bucket: ${bucketName}`);
+    
+    return true;
+  } catch (error) {
+    console.error(`Error cleaning up bucket ${bucketName}:`, error);
+    return false;
+  }
+}
+
+// Clean up all terraform buckets
 async function cleanupAllBuckets() {
   try {
-    // Find all buckets matching our pattern
-    const bucketsToDelete = await findAllTemporaryBuckets();
+    const bucketsToDelete = await findAllTerraformBuckets();
     
-    // Also include any buckets we've tracked in this session
+    // Add tracked buckets
     createdBuckets.forEach(bucket => {
       if (!bucketsToDelete.includes(bucket)) {
         bucketsToDelete.push(bucket);
       }
     });
     
-    console.log(`Found ${bucketsToDelete.length} temporary buckets to delete`);
+    console.log(`Found ${bucketsToDelete.length} terraform buckets to clean up`);
     
     let deletedCount = 0;
     for (const bucketName of bucketsToDelete) {
-      try {
-        // Empty the bucket first
-        const { Contents } = await s3Client.send(new ListObjectsV2Command({ Bucket: bucketName }));
+      const success = await cleanupBucket(bucketName);
+      if (success) {
+        deletedCount++;
+        createdBuckets.delete(bucketName);
         
-        if (Contents && Contents.length > 0) {
-          for (const obj of Contents) {
-            await s3Client.send(new DeleteObjectCommand({ 
-              Bucket: bucketName, 
-              Key: obj.Key 
-            }));
-            console.log(`Deleted object ${obj.Key} from bucket ${bucketName}`);
+        // Remove from template mapping
+        for (const [template, bucket] of templateBuckets.entries()) {
+          if (bucket === bucketName) {
+            templateBuckets.delete(template);
+            break;
           }
         }
-        
-        // Delete the bucket
-        console.log(`Deleting S3 bucket: ${bucketName}`);
-        await s3Client.send(new DeleteBucketCommand({ Bucket: bucketName }));
-        
-        // Remove from our tracked list
-        createdBuckets.delete(bucketName);
-        s3BucketName = null;
-        
-        deletedCount++;
-      } catch (error) {
-        console.error(`Error deleting bucket ${bucketName}:`, error);
       }
     }
     
@@ -113,7 +190,7 @@ async function cleanupAllBuckets() {
       deleted: deletedCount
     };
   } catch (error) {
-    console.error('Error cleaning up buckets:', error);
+    console.error('Error in cleanup process:', error);
     return {
       success: false,
       error: error.message
@@ -121,66 +198,29 @@ async function cleanupAllBuckets() {
   }
 }
 
-// Create S3 bucket for temporary storage if it doesn't exist
-async function ensureS3Bucket() {
-  if (!s3BucketName) {
-    s3BucketName = generateBucketName();
-    try {
-      console.log(`Creating S3 bucket: ${s3BucketName}`);
-      await s3Client.send(new CreateBucketCommand({
-        Bucket: s3BucketName,
-        CreateBucketConfiguration: s3Region !== 'us-east-1' ? { LocationConstraint: s3Region } : undefined
-      }));
-      console.log(`Successfully created bucket: ${s3BucketName}`);
-      
-      // Track this bucket
-      createdBuckets.add(s3BucketName);
-    } catch (error) {
-      console.error(`Error creating S3 bucket ${s3BucketName}:`, error);
-      throw error;
-    }
-  } else {
-    // Check if bucket exists
-    try {
-      await s3Client.send(new HeadBucketCommand({ Bucket: s3BucketName }));
-    } catch (error) {
-      if (error.name === 'NotFound' || error.name === 'NoSuchBucket') {
-        // Bucket doesn't exist, create it
-        s3BucketName = generateBucketName();
-        await s3Client.send(new CreateBucketCommand({
-          Bucket: s3BucketName,
-          CreateBucketConfiguration: s3Region !== 'us-east-1' ? { LocationConstraint: s3Region } : undefined
-        }));
-        
-        // Track this bucket
-        createdBuckets.add(s3BucketName);
-      } else {
-        throw error;
-      }
-    }
-  }
-  return s3BucketName;
-}
-
 // Upload state files to S3
-async function uploadStateToS3(templateName) {
+async function uploadStateToS3(templateName, bucketName) {
   try {
-    const bucketName = await ensureS3Bucket();
-    const stateFiles = fs.readdirSync(terraformPath).filter(file => file.includes('.tfstate'));
+    const stateFiles = fs.readdirSync(terraformPath).filter(file => 
+      file.includes('.tfstate') || file === 'terraform.tfstate'
+    );
     
     for (const stateFile of stateFiles) {
-      const fileContent = fs.readFileSync(path.join(terraformPath, stateFile));
-      
-      await s3Client.send(new PutObjectCommand({
-        Bucket: bucketName,
-        Key: `${templateName}/${stateFile}`,
-        Body: fileContent
-      }));
-      
-      console.log(`Uploaded ${stateFile} for ${templateName} to ${bucketName}`);
+      const filePath = path.join(terraformPath, stateFile);
+      if (fs.existsSync(filePath)) {
+        const fileContent = fs.readFileSync(filePath);
+        
+        await s3Client.send(new PutObjectCommand({
+          Bucket: bucketName,
+          Key: `${templateName}/${stateFile}`,
+          Body: fileContent
+        }));
+        
+        console.log(`Uploaded ${stateFile} for ${templateName} to ${bucketName}`);
+      }
     }
     
-    return bucketName;
+    return true;
   } catch (error) {
     console.error(`Error uploading state to S3:`, error);
     throw error;
@@ -188,36 +228,33 @@ async function uploadStateToS3(templateName) {
 }
 
 // Download state files from S3
-async function downloadStateFromS3(templateName) {
-  if (!s3BucketName) {
-    return false; // No bucket exists yet
-  }
-  
+async function downloadStateFromS3(templateName, bucketName) {
   try {
     const prefix = `${templateName}/`;
     const { Contents } = await s3Client.send(new ListObjectsV2Command({ 
-      Bucket: s3BucketName,
+      Bucket: bucketName,
       Prefix: prefix
     }));
     
     if (!Contents || Contents.length === 0) {
-      return false; // No state files for this template
+      console.log(`No state files found for template ${templateName}`);
+      return false;
     }
     
     for (const obj of Contents) {
       const { Body } = await s3Client.send(new GetObjectCommand({
-        Bucket: s3BucketName,
+        Bucket: bucketName,
         Key: obj.Key
       }));
       
       let streamData = Buffer.from([]);
-      
       for await (const chunk of Body) {
         streamData = Buffer.concat([streamData, chunk]);
       }
       
       const fileName = path.basename(obj.Key);
-      await fs.promises.writeFile(path.join(terraformPath, fileName), streamData);
+      const filePath = path.join(terraformPath, fileName);
+      await fs.promises.writeFile(filePath, streamData);
       console.log(`Downloaded ${fileName} for template ${templateName}`);
     }
     
@@ -229,15 +266,11 @@ async function downloadStateFromS3(templateName) {
 }
 
 // Delete template state from S3
-async function deleteTemplateFromS3(templateName) {
-  if (!s3BucketName) {
-    return false;
-  }
-  
+async function deleteTemplateFromS3(templateName, bucketName) {
   try {
     const prefix = `${templateName}/`;
     const { Contents } = await s3Client.send(new ListObjectsV2Command({ 
-      Bucket: s3BucketName,
+      Bucket: bucketName,
       Prefix: prefix
     }));
     
@@ -247,10 +280,10 @@ async function deleteTemplateFromS3(templateName) {
     
     for (const obj of Contents) {
       await s3Client.send(new DeleteObjectCommand({
-        Bucket: s3BucketName,
+        Bucket: bucketName,
         Key: obj.Key
       }));
-      console.log(`Deleted ${obj.Key} from bucket ${s3BucketName}`);
+      console.log(`Deleted ${obj.Key} from bucket ${bucketName}`);
     }
     
     return true;
@@ -267,7 +300,7 @@ function runTerraformCommand(command, args = []) {
       return reject(`Terraform project path not found: ${terraformPath}`);
     }
     
-    console.log(`Running terraform ${command} in ${terraformPath}`);
+    console.log(`Running terraform ${command} ${args.join(' ')} in ${terraformPath}`);
     
     const terraform = spawn('terraform', [command, ...args], {
       cwd: terraformPath,
@@ -317,73 +350,50 @@ function runTerraformCommand(command, args = []) {
   });
 }
 
-// Modify Terraform files to use local state
-async function prepareLocalState() {
-  try {
-    const mainTfPath = path.join(terraformPath, 'main.tf');
-    
-    if (fs.existsSync(mainTfPath)) {
-      let content = fs.readFileSync(mainTfPath, 'utf8');
-      
-      // Simple regex to comment out S3 backend block if it exists
-      const s3BackendRegex = /(terraform\s*\{[^{]*backend\s*"s3"\s*\{[^}]*\}[^}]*\})/gs;
-      if (s3BackendRegex.test(content)) {
-        // Comment out S3 backend block
-        content = content.replace(s3BackendRegex, '/*\n$1\n*/');
-        
-        // Add local backend
-        if (!content.includes('backend "local"')) {
-          content = content.replace(
-            /terraform\s*\{/,
-            'terraform {\n  backend "local" {}\n'
-          );
-        }
-        
-        fs.writeFileSync(mainTfPath, content);
-        console.log('Modified main.tf to use local state');
-      }
-    }
-    
-    return true;
-  } catch (error) {
-    console.error('Error preparing local state:', error);
-    return false;
-  }
-}
+// API Routes
 
-// API Health check endpoint
+// Health check endpoint
 app.get('/health', (req, res) => {
-  res.status(200).json({ status: 'ok', message: 'Terraform API is running' });
+  res.status(200).json({ 
+    status: 'ok', 
+    message: 'Terraform API is running',
+    activeTemplates: Array.from(templateBuckets.keys()),
+    trackedBuckets: Array.from(createdBuckets)
+  });
 });
 
 // Template-specific init endpoint
 app.post('/api/terraform/:templateName/init', async (req, res) => {
   try {
     const { templateName } = req.params;
-    console.log(`Received init request for template ${templateName}`);
+    const { environment = 'dev' } = req.body;
     
-    // Prepare Terraform files to use local state
-    await prepareLocalState();
+    console.log(`Initializing template ${templateName} for environment ${environment}`);
     
-    // Ensure we have an S3 bucket for storing state after init
-    await ensureS3Bucket();
+    // Get or create bucket for this template
+    const bucketName = await getTemplateBucket(templateName, environment);
     
-    // Run terraform init with local state
+    // Run terraform init
     const args = req.body.args || [];
     const result = await runTerraformCommand('init', args);
     
-    // Upload state files to S3
-    await uploadStateToS3(templateName);
+    // Upload initial state
+    await uploadStateToS3(templateName, bucketName);
     
     res.status(200).json({
       ...result,
       templateName,
-      s3BucketName,
+      environment,
+      bucketName,
       message: `Template ${templateName} initialized successfully`
     });
   } catch (error) {
-    console.error(`Error running terraform init for template ${req.params.templateName}:`, error);
-    res.status(500).json({ success: false, error: error.message || JSON.stringify(error) });
+    console.error(`Error initializing template ${req.params.templateName}:`, error);
+    res.status(500).json({ 
+      success: false, 
+      error: error.message || JSON.stringify(error),
+      templateName: req.params.templateName
+    });
   }
 });
 
@@ -391,26 +401,46 @@ app.post('/api/terraform/:templateName/init', async (req, res) => {
 app.post('/api/terraform/:templateName/apply', async (req, res) => {
   try {
     const { templateName } = req.params;
-    console.log(`Received apply request for template ${templateName}`);
+    const { environment = 'dev' } = req.body;
     
-    // Download existing state if available
-    await downloadStateFromS3(templateName);
+    console.log(`Applying template ${templateName} for environment ${environment}`);
     
+    // Get bucket for this template
+    const bucketName = await getTemplateBucket(templateName, environment);
+    
+    // Download existing state
+    await downloadStateFromS3(templateName, bucketName);
+    
+    // Run terraform apply
     const args = req.body.args || ['-auto-approve'];
     const result = await runTerraformCommand('apply', args);
     
-    // Upload updated state to S3
-    await uploadStateToS3(templateName);
+    // Parse output to get actual bucket name created by Terraform
+    const actualBucketName = parseTerraformOutput(result.output);
+    if (actualBucketName && actualBucketName !== bucketName) {
+      console.log(`Terraform created bucket: ${actualBucketName}, updating tracking`);
+      templateBuckets.set(templateName, actualBucketName);
+      createdBuckets.add(actualBucketName);
+    }
+    
+    // Upload updated state
+    await uploadStateToS3(templateName, bucketName);
     
     res.status(200).json({
       ...result,
       templateName,
-      s3BucketName,
+      environment,
+      bucketName,
+      actualBucketName,
       message: `Template ${templateName} applied successfully`
     });
   } catch (error) {
-    console.error(`Error running terraform apply for template ${req.params.templateName}:`, error);
-    res.status(500).json({ success: false, error: error.message || JSON.stringify(error) });
+    console.error(`Error applying template ${req.params.templateName}:`, error);
+    res.status(500).json({ 
+      success: false, 
+      error: error.message || JSON.stringify(error),
+      templateName: req.params.templateName
+    });
   }
 });
 
@@ -418,41 +448,122 @@ app.post('/api/terraform/:templateName/apply', async (req, res) => {
 app.post('/api/terraform/:templateName/destroy', async (req, res) => {
   try {
     const { templateName } = req.params;
-    console.log(`Received destroy request for template ${templateName}`);
+    const { environment = 'dev' } = req.body;
     
-    // Download existing state if available
-    await downloadStateFromS3(templateName);
+    console.log(`Destroying template ${templateName} for environment ${environment}`);
     
+    // Get bucket for this template
+    const bucketName = await getTemplateBucket(templateName, environment);
+    
+    // Download existing state
+    await downloadStateFromS3(templateName, bucketName);
+    
+    // Run terraform destroy
     const args = req.body.args || ['-auto-approve'];
     const result = await runTerraformCommand('destroy', args);
     
-    // Delete template state from S3
-    await deleteTemplateFromS3(templateName);
+    // Clean up template state from S3
+    await deleteTemplateFromS3(templateName, bucketName);
     
-    // Enhanced cleanup to ensure all temporary buckets are removed
-    const cleanupResult = await cleanupAllBuckets();
-    console.log('Cleanup result:', cleanupResult);
+    // Clean up the bucket itself
+    await cleanupBucket(bucketName);
+    
+    // Remove from tracking
+    templateBuckets.delete(templateName);
+    createdBuckets.delete(bucketName);
     
     res.status(200).json({
       ...result,
       templateName,
-      message: `Template ${templateName} destroyed and resources cleaned up`,
-      cleanup: cleanupResult
+      environment,
+      bucketName,
+      message: `Template ${templateName} destroyed and cleaned up successfully`
     });
   } catch (error) {
-    console.error(`Error running terraform destroy for template ${req.params.templateName}:`, error);
-    res.status(500).json({ success: false, error: error.message || JSON.stringify(error) });
+    console.error(`Error destroying template ${req.params.templateName}:`, error);
+    res.status(500).json({ 
+      success: false, 
+      error: error.message || JSON.stringify(error),
+      templateName: req.params.templateName
+    });
   }
 });
 
-// Get S3 bucket status
-app.get('/api/bucket', (req, res) => {
-  res.status(200).json({
-    success: true,
-    s3BucketName,
-    exists: s3BucketName !== null,
-    allBuckets: Array.from(createdBuckets)
-  });
+// Get template status
+app.get('/api/terraform/:templateName/status', async (req, res) => {
+  try {
+    const { templateName } = req.params;
+    const bucketName = templateBuckets.get(templateName);
+    
+    let hasState = false;
+    let stateFiles = [];
+    
+    if (bucketName) {
+      try {
+        const { Contents } = await s3Client.send(new ListObjectsV2Command({ 
+          Bucket: bucketName,
+          Prefix: `${templateName}/`
+        }));
+        
+        if (Contents && Contents.length > 0) {
+          hasState = true;
+          stateFiles = Contents.map(obj => obj.Key);
+        }
+      } catch (error) {
+        console.error(`Error checking template status:`, error);
+      }
+    }
+    
+    res.status(200).json({
+      success: true,
+      templateName,
+      bucketName,
+      hasState,
+      stateFiles
+    });
+  } catch (error) {
+    console.error(`Error getting template status:`, error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// List active templates
+app.get('/api/templates', async (req, res) => {
+  try {
+    const templates = [];
+    
+    for (const [templateName, bucketName] of templateBuckets.entries()) {
+      try {
+        const { Contents } = await s3Client.send(new ListObjectsV2Command({ 
+          Bucket: bucketName,
+          Prefix: `${templateName}/`
+        }));
+        
+        templates.push({
+          name: templateName,
+          bucketName,
+          hasState: Contents && Contents.length > 0,
+          stateFiles: Contents ? Contents.length : 0
+        });
+      } catch (error) {
+        templates.push({
+          name: templateName,
+          bucketName,
+          hasState: false,
+          error: error.message
+        });
+      }
+    }
+    
+    res.status(200).json({
+      success: true,
+      templates,
+      totalBuckets: createdBuckets.size
+    });
+  } catch (error) {
+    console.error('Error listing templates:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
 });
 
 // Cleanup all resources
@@ -460,67 +571,41 @@ app.post('/api/cleanup', async (req, res) => {
   try {
     const cleanupResult = await cleanupAllBuckets();
     
+    // Clear tracking
+    templateBuckets.clear();
+    createdBuckets.clear();
+    
     res.status(200).json({
       success: cleanupResult.success,
       message: cleanupResult.success ? 
-        `All resources cleaned up successfully. Deleted ${cleanupResult.deleted} of ${cleanupResult.total} buckets.` : 
+        `All resources cleaned up. Deleted ${cleanupResult.deleted} of ${cleanupResult.total} buckets.` : 
         'Error cleaning up some resources',
       details: cleanupResult
     });
   } catch (error) {
     console.error('Error cleaning up resources:', error);
-    res.status(500).json({ success: false, error: error.message || JSON.stringify(error) });
-  }
-});
-
-// List active templates
-app.get('/api/templates', async (req, res) => {
-  try {
-    if (!s3BucketName) {
-      return res.status(200).json({
-        success: true,
-        templates: []
-      });
-    }
-    
-    // List all directories in the bucket (each directory represents a template)
-    const { CommonPrefixes } = await s3Client.send(new ListObjectsV2Command({ 
-      Bucket: s3BucketName,
-      Delimiter: '/'
-    }));
-    
-    const templates = CommonPrefixes ? 
-      CommonPrefixes.map(prefix => prefix.Prefix.replace('/', '')) : 
-      [];
-    
-    res.status(200).json({
-      success: true,
-      s3BucketName,
-      templates
-    });
-  } catch (error) {
-    console.error('Error listing templates:', error);
-    res.status(500).json({ success: false, error: error.message || JSON.stringify(error) });
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
 // List all available endpoints
 app.get('/', (req, res) => {
   const endpoints = [
-    { method: 'GET', path: '/health', description: 'Health check' },
-    { method: 'POST', path: '/api/terraform/:templateName/init', description: 'Initialize Terraform for a specific template' },
-    { method: 'POST', path: '/api/terraform/:templateName/apply', description: 'Apply Terraform configuration for a specific template' },
-    { method: 'POST', path: '/api/terraform/:templateName/destroy', description: 'Destroy Terraform resources for a specific template' },
-    { method: 'GET', path: '/api/bucket', description: 'Get S3 bucket status' },
-    { method: 'GET', path: '/api/templates', description: 'List active templates' },
+    { method: 'GET', path: '/health', description: 'Health check and status' },
+    { method: 'POST', path: '/api/terraform/:templateName/init', description: 'Initialize Terraform for template' },
+    { method: 'POST', path: '/api/terraform/:templateName/apply', description: 'Apply Terraform configuration' },
+    { method: 'POST', path: '/api/terraform/:templateName/destroy', description: 'Destroy Terraform resources' },
+    { method: 'GET', path: '/api/terraform/:templateName/status', description: 'Get template status' },
+    { method: 'GET', path: '/api/templates', description: 'List all active templates' },
     { method: 'POST', path: '/api/cleanup', description: 'Clean up all resources' }
   ];
   
   res.status(200).json({
     name: 'Terraform API Server',
-    version: '1.0.0',
+    version: '2.0.0',
     terraformPath,
-    s3BucketName,
+    s3Region,
+    activeTemplates: Object.fromEntries(templateBuckets),
     createdBuckets: Array.from(createdBuckets),
     endpoints
   });
@@ -528,41 +613,29 @@ app.get('/', (req, res) => {
 
 // Start the server
 app.listen(port, () => {
-  console.log(`Terraform API server listening at http://localhost:${port}`);
+  console.log(`Terraform API server v2.0 listening at http://localhost:${port}`);
   console.log(`Using Terraform project path: ${terraformPath}`);
   console.log(`Using AWS region: ${s3Region}`);
   
-  // Log all available endpoints
-  console.log('Available endpoints:');
+  // Log available endpoints
+  console.log('\nAvailable endpoints:');
   console.log('GET  /health');
   console.log('GET  /');
   console.log('POST /api/terraform/:templateName/init');
   console.log('POST /api/terraform/:templateName/apply');
   console.log('POST /api/terraform/:templateName/destroy');
-  console.log('GET  /api/bucket');
+  console.log('GET  /api/terraform/:templateName/status');
   console.log('GET  /api/templates');
   console.log('POST /api/cleanup');
 });
 
-// Handle graceful shutdown
+// Graceful shutdown
 process.on('SIGTERM', () => {
-  console.log('SIGTERM signal received: closing HTTP server');
-  cleanupAllBuckets().then(() => {
-    console.log('All buckets cleaned up during shutdown');
-    process.exit(0);
-  }).catch(() => {
-    console.log('Error cleaning up buckets during shutdown');
-    process.exit(1);
-  });
+  console.log('SIGTERM received: cleaning up and shutting down...');
+  cleanupAllBuckets().finally(() => process.exit(0));
 });
 
 process.on('SIGINT', () => {
-  console.log('SIGINT signal received: closing HTTP server');
-  cleanupAllBuckets().then(() => {
-    console.log('All buckets cleaned up during shutdown');
-    process.exit(0);
-  }).catch(() => {
-    console.log('Error cleaning up buckets during shutdown');
-    process.exit(1);
-  });
+  console.log('SIGINT received: cleaning up and shutting down...');
+  cleanupAllBuckets().finally(() => process.exit(0));
 });

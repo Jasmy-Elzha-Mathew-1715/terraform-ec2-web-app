@@ -129,3 +129,27 @@ variable "ssh_key_name" {
   type        = string
   default     = "my-key-pair"  # The name you gave your key pair
 }
+
+variable "key_name" {
+  description = "Name of the AWS key pair to use for EC2 instances"
+  type        = string
+  default     = null  # Optional: set to null if you don't want to require SSH access
+  
+  validation {
+    condition = var.key_name == null || can(regex("^[a-zA-Z0-9][a-zA-Z0-9-_.]*$", var.key_name))
+    error_message = "Key name must be a valid AWS key pair name or null."
+  }
+}
+
+variable "admin_cidr_blocks" {
+  description = "List of CIDR blocks that should have administrative access (SSH, etc.)"
+  type        = list(string)
+  default     = []  # Empty list means no admin access by default
+  
+  validation {
+    condition = alltrue([
+      for cidr in var.admin_cidr_blocks : can(cidrhost(cidr, 0))
+    ])
+    error_message = "All admin_cidr_blocks must be valid CIDR notation."
+  }
+}

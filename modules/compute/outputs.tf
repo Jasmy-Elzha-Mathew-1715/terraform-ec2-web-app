@@ -1,21 +1,31 @@
+# Output the security group ID for the web application
+output "backend_security_group_id" {
+  description = "ID of the web application security group"
+  value       = aws_security_group.web_app_sg.id
+}
+
+# Output the ALB name
+output "alb_name" {
+  description = "Name of the Application Load Balancer"
+  value       = aws_lb.web_alb.name
+}
+
+# Output the single web app instance ID (used as backend instance)
 output "backend_instance_id" {
-  description = "ID of the backend EC2 instance"
-  value       = aws_instance.backend.id
+  description = "ID of the web application EC2 instance"
+  value       = aws_instance.web_app.id
 }
 
-output "backend_instance_private_ip" {
-  description = "Private IP of the backend EC2 instance"
-  value       = aws_instance.backend.private_ip
-}
-
+# Output the same instance ID for frontend (since it's the same instance)
 output "frontend_instance_id" {
-  description = "ID of the frontend EC2 instance"
-  value       = aws_instance.frontend.id
+  description = "ID of the web application EC2 instance (same as backend)"
+  value       = aws_instance.web_app.id
 }
 
-output "frontend_instance_private_ip" {
-  description = "Private IP of the frontend EC2 instance"
-  value       = aws_instance.frontend.private_ip
+# Additional useful outputs
+output "web_app_instance_id" {
+  description = "ID of the web application EC2 instance"
+  value       = aws_instance.web_app.id
 }
 
 output "alb_dns_name" {
@@ -23,47 +33,27 @@ output "alb_dns_name" {
   value       = aws_lb.web_alb.dns_name
 }
 
-output "alb_arn" {
-  description = "ARN of the Application Load Balancer"
-  value       = aws_lb.web_alb.arn
+output "alb_zone_id" {
+  description = "Zone ID of the Application Load Balancer"
+  value       = aws_lb.web_alb.zone_id
+}
+
+output "web_app_security_group_id" {
+  description = "ID of the web application security group"
+  value       = aws_security_group.web_app_sg.id
 }
 
 output "alb_security_group_id" {
-  description = "ID of the security group for the ALB"
+  description = "ID of the ALB security group"
   value       = aws_security_group.alb_sg.id
 }
 
-output "backend_security_group_id" {
-  description = "ID of the security group for the backend instance"
-  value       = aws_security_group.backend_sg.id
+output "frontend_target_group_arn" {
+  description = "ARN of the frontend target group"
+  value       = aws_lb_target_group.frontend_tg.arn
 }
 
-output "frontend_security_group_id" {
-  description = "ID of the security group for the frontend instance"
-  value       = aws_security_group.frontend_sg.id
-}
-
-output "ec2_iam_role_arn" {
-  description = "ARN of the IAM role for EC2 instances"
-  value       = aws_iam_role.ec2_role.arn
-}
-
-output "ec2_iam_role_name" {
-  description = "Name of the IAM role for EC2 instances"
-  value       = aws_iam_role.ec2_role.name
-}
-
-output "application_url" {
-  description = "The URL for the web application"
-  value       = "http://${var.domain_name}"
-}
-
-output "alb_name" {
-  description = "Name of the Application Load Balancer"
-  value       = aws_lb.main.name
-}
-
-output "alb_zone_id" {
-  description = "Canonical hosted zone ID of the Application Load Balancer"
-  value       = aws_lb.main.zone_id
+output "backend_target_group_arn" {
+  description = "ARN of the backend target group"
+  value       = aws_lb_target_group.backend_tg.arn
 }

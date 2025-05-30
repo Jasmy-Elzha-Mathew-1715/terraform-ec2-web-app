@@ -6,12 +6,8 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 4.0"  # Or newer
     }
-    random = {
-      source  = "hashicorp/random"
-      version = "~> 3.0"
-    }
     null = {
-      source  = "hashicorp/null"
+      source  = "hashicorp/null"  
       version = "~> 3.0"
     }
   }
@@ -30,20 +26,18 @@ provider "aws" {
   }
 }
 
-# Generate a random suffix for the S3 bucket
-resource "random_id" "bucket_suffix" {
-  byte_length = 8
-}
-
-# Create S3 bucket for Terraform state
+# Create S3 bucket with predictable naming pattern for API integration
 resource "aws_s3_bucket" "terraform_state" {
-  bucket = "terraform-state-${var.project_name}-${random_id.bucket_suffix.hex}"
+  bucket = "terraform-state-${var.project_name}-${var.environment}"
 
   # Force destroy allows the bucket to be destroyed even with content
   force_destroy = true
 
   tags = {
-    Name = "Terraform State"
+    Name        = "Terraform State Storage"
+    Purpose     = "API-managed"
+    Template    = var.project_name
+    Environment = var.environment
   }
 }
 
@@ -67,16 +61,40 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "terraform_state_e
   }
 }
 
-# Local state backend initially, can be switched to S3 after first apply
-# For S3 backend, you'll need to comment this out, run terraform init & apply,
-# then uncomment it and run terraform init with -backend-config options
+# Block public access to the state bucket
+resource "aws_s3_bucket_public_access_block" "terraform_state_pab" {
+  bucket = aws_s3_bucket.terraform_state.id
+
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+# Use local backend initially - this allows the API to manage state files
 terraform {
-  backend "local" {}
-  # backend "s3" {
-  #   key     = "terraform-ec2-web-app/terraform.tfstate"
-  #   region  = "us-east-1"
-  #   encrypt = true
-  # }
+  backend "local" {
+    path = "terraform.tfstate"
+  }
+}
+
+# Data source to get current AWS account ID and region for consistent naming
+data "aws_caller_identity" "current" {}
+data "aws_region" "current" {}
+
+# Local values for consistent naming across resources
+locals {
+  # Create a consistent bucket name pattern that your API can predict
+  state_bucket_name = "terraform-state-${var.project_name}-${var.environment}"
+  
+  # Common tags applied to all resources
+  common_tags = {
+    Project     = var.project_name
+    Environment = var.environment
+    ManagedBy   = "Terraform"
+    AccountId   = data.aws_caller_identity.current.account_id
+    Region      = data.aws_region.current.name
+  }
 }
 
 # Networking Module - VPC, Subnets, Internet Gateway, NAT Gateway
@@ -90,33 +108,32 @@ module "networking" {
   private_subnets = var.private_subnets
 }
 
-# Compute Module - EC2 Instances, Application Load Balancer
+# Compute Module - Single EC2 Instance with ALB
 module "compute" {
   source = "./modules/compute"
 
-  project_name      = var.project_name
-  environment       = var.environment
-  vpc_id            = module.networking.vpc_id
-  public_subnet_ids = module.networking.public_subnet_ids
-  aws_region        = var.aws_region
-  db_secret_arn     = module.database.db_secret_arn
+  project_name         = var.project_name
+  environment          = var.environment
+  vpc_id               = module.networking.vpc_id
+  public_subnet_ids    = module.networking.public_subnet_ids
+  aws_region           = var.aws_region
+  db_secret_arn        = module.database.db_secret_arn
   artifacts_bucket_arn = module.storage.artifacts_bucket_arn
   
-  backend_instance_type  = var.backend_instance_type
-  frontend_instance_type = var.frontend_instance_type
-  backend_ami_id         = var.backend_ami_id
-  frontend_ami_id        = var.frontend_ami_id
+  instance_type     = var.backend_instance_type
+  key_name         = var.key_name
+  admin_cidr_blocks = var.admin_cidr_blocks
 }
 
 # Database Module - RDS PostgreSQL
 module "database" {
   source = "./modules/database"
 
-  project_name      = var.project_name
-  environment       = var.environment
-  vpc_id            = module.networking.vpc_id
+  project_name       = var.project_name
+  environment        = var.environment
+  vpc_id             = module.networking.vpc_id
   private_subnet_ids = module.networking.private_subnet_ids
-  backend_sg_id     = module.compute.backend_security_group_id
+  backend_sg_id      = module.compute.backend_security_group_id
   
   db_instance_class = var.db_instance_class
   db_name           = var.db_name
@@ -162,8 +179,36 @@ module "monitoring" {
   frontend_instance_id = module.compute.frontend_instance_id
 }
 
-# Output the name of the generated S3 bucket for reference
+# Outputs for API integration
 output "terraform_state_bucket" {
   value       = aws_s3_bucket.terraform_state.bucket
   description = "The name of the S3 bucket used for Terraform state storage"
+}
+
+output "terraform_state_bucket_arn" {
+  value       = aws_s3_bucket.terraform_state.arn
+  description = "The ARN of the S3 bucket used for Terraform state storage"
+}
+
+output "terraform_state_bucket_region" {
+  value       = aws_s3_bucket.terraform_state.region
+  description = "The region of the S3 bucket used for Terraform state storage"
+}
+
+# Output the predictable bucket name pattern for API reference
+output "bucket_name_pattern" {
+  value       = "terraform-state-{project_name}-{environment}"
+  description = "The naming pattern used for state buckets"
+}
+
+# Output current configuration for debugging
+output "current_config" {
+  value = {
+    project_name    = var.project_name
+    environment     = var.environment
+    aws_region      = var.aws_region
+    account_id      = data.aws_caller_identity.current.account_id
+    bucket_name     = local.state_bucket_name
+  }
+  description = "Current configuration details for debugging"
 }
