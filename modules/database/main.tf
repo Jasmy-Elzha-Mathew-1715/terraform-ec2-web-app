@@ -50,34 +50,31 @@ resource "aws_db_subnet_group" "rds_subnet_group" {
   }
 }
 
-# AWS Secrets Manager for RDS credentials
-resource "aws_secretsmanager_secret" "db_secret" {
-  name = "${var.project_name}-${var.environment}-db-secret-${formatdate("YYMMDDhhmmss", timestamp())}"
-  description = "RDS PostgreSQL credentials for ${var.project_name} ${var.environment}"
+# RDS Parameter Group
+resource "aws_db_parameter_group" "postgres" {
+  name        = "${var.project_name}-${var.environment}-postgres-params"
+  family      = "postgres17"
+  description = "Parameter group for ${var.project_name} PostgreSQL"
+
+  parameter {
+    name  = "log_connections"
+    value = "1"
+  }
+
+  parameter {
+    name  = "log_disconnections"
+    value = "1"
+  }
+
+  parameter {
+    name  = "log_statement"
+    value = "ddl"
+  }
 
   tags = {
-    Name        = "${var.project_name}-db-credentials"
+    Name        = "${var.project_name}-postgres-params"
     Environment = var.environment
   }
-}
-
-# Store credentials in Secrets Manager
-resource "aws_secretsmanager_secret_version" "db_secret_version" {
-  secret_id = aws_secretsmanager_secret.db_secret.id
-  secret_string = jsonencode({
-    username            = var.db_username
-    password            = random_password.db_password.result
-    engine              = "postgres"
-    host                = aws_db_instance.postgres.address
-    port                = aws_db_instance.postgres.port
-    dbname              = var.db_name
-    dbInstanceIdentifier = aws_db_instance.postgres.id
-  })
-}
-
-resource "aws_db_parameter_group" "main_params" {
-  name   = "${var.project_name}-${var.environment}-main-params"
-  family = "postgres17"
 }
 
 # RDS PostgreSQL Instance
@@ -112,85 +109,5 @@ resource "aws_db_instance" "postgres" {
 
   lifecycle {
     prevent_destroy = false
-  }
-}
-
-# RDS Parameter Group
-resource "aws_db_parameter_group" "postgres" {
-  name        = "${var.project_name}-${var.environment}-postgres-params"
-  family      = "postgres17"
-  description = "Parameter group for ${var.project_name} PostgreSQL"
-
-  parameter {
-    name  = "log_connections"
-    value = "1"
-  }
-
-  parameter {
-    name  = "log_disconnections"
-    value = "1"
-  }
-
-  parameter {
-    name  = "log_statement"
-    value = "ddl"
-  }
-
-  tags = {
-    Name        = "${var.project_name}-postgres-params"
-    Environment = var.environment
-  }
-}
-
-resource "aws_db_instance" "main" {
-  identifier             = "${var.project_name}-${var.environment}-db"
-  allocated_storage      = 20
-  storage_type           = "gp2"
-  engine                 = "postgres"
-  engine_version         = "17"
-  instance_class         = var.db_instance_class
-  db_name                = var.db_name
-  username               = var.db_username
-  password               = var.db_password
-  parameter_group_name   = aws_db_parameter_group.main_params.name
-  skip_final_snapshot    = true
-  vpc_security_group_ids = [aws_security_group.db.id]
-  db_subnet_group_name   = aws_db_subnet_group.main.name
-
-  tags = {
-    Name = "${var.project_name}-${var.environment}-db"
-  }
-}
-
-resource "aws_db_subnet_group" "main" {
-  name       = "${var.project_name}-${var.environment}-db-subnet-group"
-  subnet_ids = var.private_subnet_ids
-
-  tags = {
-    Name = "${var.project_name}-${var.environment}-db-subnet-group"
-  }
-}
-
-resource "aws_security_group" "db" {
-  name        = "${var.project_name}-${var.environment}-db-sg"
-  description = "Allow inbound traffic to database"
-  vpc_id      = var.vpc_id
-
-  ingress {
-    from_port       = 5432
-    to_port         = 5432
-    protocol        = "tcp"
-    security_groups = [var.backend_sg_id]
-  }
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  tags = {
-    Name = "${var.project_name}-${var.environment}-db-sg"
   }
 }

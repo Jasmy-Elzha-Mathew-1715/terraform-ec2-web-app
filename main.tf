@@ -108,17 +108,29 @@ module "networking" {
   private_subnets = var.private_subnets
 }
 
-# Compute Module - Single EC2 Instance with ALB
+# ALB Module - Application Load Balancer (create first to avoid circular dependency)
+module "alb" {
+  source = "./modules/alb"
+
+  project_name        = var.project_name
+  environment         = var.environment
+  vpc_id              = module.networking.vpc_id
+  public_subnet_ids   = module.networking.public_subnet_ids
+  target_instance_ids = [module.compute.instance_id]
+}
+
+# Compute Module - Single EC2 Instance
 module "compute" {
   source = "./modules/compute"
 
-  project_name         = var.project_name
-  environment          = var.environment
-  vpc_id               = module.networking.vpc_id
-  public_subnet_ids    = module.networking.public_subnet_ids
-  aws_region           = var.aws_region
-  db_secret_arn        = module.database.db_secret_arn
-  artifacts_bucket_arn = module.storage.artifacts_bucket_arn
+  project_name             = var.project_name
+  environment              = var.environment
+  vpc_id                   = module.networking.vpc_id
+  public_subnet_ids        = module.networking.public_subnet_ids
+  aws_region               = var.aws_region
+  db_secret_arn            = module.encryption.secret_arn
+  artifacts_bucket_arn     = module.storage.artifacts_bucket_arn
+  alb_security_group_ids   = [module.alb.alb_security_group_id]
   
   instance_type     = var.backend_instance_type
   key_name         = var.key_name
@@ -129,15 +141,30 @@ module "compute" {
 module "database" {
   source = "./modules/database"
 
-  project_name       = var.project_name
-  environment        = var.environment
-  vpc_id             = module.networking.vpc_id
-  private_subnet_ids = module.networking.private_subnet_ids
-  backend_sg_id      = module.compute.backend_security_group_id
+  project_name               = var.project_name
+  environment                = var.environment
+  vpc_id                     = module.networking.vpc_id
+  private_subnet_ids         = module.networking.private_subnet_ids
+  backend_sg_id              = module.compute.security_group_id
   
-  db_instance_class = var.db_instance_class
-  db_name           = var.db_name
-  db_username       = var.db_username
+  db_instance_class          = var.db_instance_class
+  db_allocated_storage       = var.db_allocated_storage
+  db_name                    = var.db_name
+  db_username                = var.db_username
+  db_multi_az                = var.db_multi_az
+  db_backup_retention_period = var.db_backup_retention_period
+}
+
+# Encryption Module - AWS Secrets Manager for database credentials
+module "encryption" {
+  source = "./modules/encryption"
+
+  project_name = var.project_name
+  environment  = var.environment
+  db_username  = var.db_username
+  db_password  = var.db_password
+  db_name      = var.db_name
+  
 }
 
 # Storage Module - S3 for CI/CD artifacts
@@ -173,42 +200,9 @@ module "monitoring" {
 
   project_name        = var.project_name
   db_instance_id      = module.database.db_instance_id
-  alb_name            = module.compute.alb_name
+  alb_name            = module.alb.alb_dns_name
   aws_region          = var.aws_region
-  backend_instance_id = module.compute.backend_instance_id
-  frontend_instance_id = module.compute.frontend_instance_id
+  backend_instance_id = module.compute.instance_id
+  frontend_instance_id = module.compute.instance_id  # Same instance hosts both frontend and backend
 }
 
-# Outputs for API integration
-output "terraform_state_bucket" {
-  value       = aws_s3_bucket.terraform_state.bucket
-  description = "The name of the S3 bucket used for Terraform state storage"
-}
-
-output "terraform_state_bucket_arn" {
-  value       = aws_s3_bucket.terraform_state.arn
-  description = "The ARN of the S3 bucket used for Terraform state storage"
-}
-
-output "terraform_state_bucket_region" {
-  value       = aws_s3_bucket.terraform_state.region
-  description = "The region of the S3 bucket used for Terraform state storage"
-}
-
-# Output the predictable bucket name pattern for API reference
-output "bucket_name_pattern" {
-  value       = "terraform-state-{project_name}-{environment}"
-  description = "The naming pattern used for state buckets"
-}
-
-# Output current configuration for debugging
-output "current_config" {
-  value = {
-    project_name    = var.project_name
-    environment     = var.environment
-    aws_region      = var.aws_region
-    account_id      = data.aws_caller_identity.current.account_id
-    bucket_name     = local.state_bucket_name
-  }
-  description = "Current configuration details for debugging"
-}

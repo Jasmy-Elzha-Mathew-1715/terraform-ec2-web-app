@@ -47,7 +47,6 @@ resource "aws_subnet" "private" {
 
 # Create NAT Gateway (in the first public subnet)
 resource "aws_eip" "nat" {
-
   tags = {
     Name = "${var.project_name}-${var.environment}-nat-eip"
   }
@@ -74,12 +73,13 @@ resource "aws_route_table" "public" {
   }
 
   tags = {
-    Name = "${var.project_name}-${var.environment}-public-route-table"
+    Name = "${var.project_name}-${var.environment}-public-rt"
   }
 }
 
 # Create route table for private subnets
 resource "aws_route_table" "private" {
+  count  = length(var.private_subnets)
   vpc_id = aws_vpc.main.id
 
   route {
@@ -88,22 +88,22 @@ resource "aws_route_table" "private" {
   }
 
   tags = {
-    Name = "${var.project_name}-${var.environment}-private-route-table"
+    Name = "${var.project_name}-${var.environment}-private-rt-${count.index + 1}"
   }
 }
 
-# Associate public subnets with public route table
+# Create route table associations for public subnets
 resource "aws_route_table_association" "public" {
-  count          = length(aws_subnet.public)
+  count          = length(var.public_subnets)
   subnet_id      = aws_subnet.public[count.index].id
   route_table_id = aws_route_table.public.id
 }
 
-# Associate private subnets with private route table
+# Create route table associations for private subnets
 resource "aws_route_table_association" "private" {
-  count          = length(aws_subnet.private)
+  count          = length(var.private_subnets)
   subnet_id      = aws_subnet.private[count.index].id
-  route_table_id = aws_route_table.private.id
+  route_table_id = aws_route_table.private[count.index].id
 }
 
 # Fetch available AZs in the region
