@@ -108,33 +108,39 @@ module "networking" {
   private_subnets = var.private_subnets
 }
 
-# ALB Module - Application Load Balancer (create first to avoid circular dependency)
+# IAM Module - IAM roles and instance profiles
+module "iam" {
+  source = "./modules/iam"
+
+  project_name = var.project_name
+  environment  = var.environment
+}
+
+# ALB Module - Application Load Balancer (create without target attachments initially)
 module "alb" {
   source = "./modules/alb"
 
-  project_name        = var.project_name
-  environment         = var.environment
-  vpc_id              = module.networking.vpc_id
-  public_subnet_ids   = module.networking.public_subnet_ids
-  target_instance_ids = [module.compute.instance_id]
+  project_name      = var.project_name
+  environment       = var.environment
+  vpc_id            = module.networking.vpc_id
+  public_subnet_ids = module.networking.public_subnet_ids
+  # Remove target_instance_ids to break circular dependency
 }
 
 # Compute Module - Single EC2 Instance
 module "compute" {
   source = "./modules/compute"
-
-  project_name             = var.project_name
-  environment              = var.environment
-  vpc_id                   = module.networking.vpc_id
-  public_subnet_ids        = module.networking.public_subnet_ids
-  aws_region               = var.aws_region
-  db_secret_arn            = module.encryption.secret_arn
-  artifacts_bucket_arn     = module.storage.artifacts_bucket_arn
-  alb_security_group_ids   = [module.alb.alb_security_group_id]
   
-  instance_type     = var.backend_instance_type
-  key_name         = var.key_name
-  admin_cidr_blocks = var.admin_cidr_blocks
+  project_name               = var.project_name
+  environment               = var.environment
+  vpc_id                    = module.networking.vpc_id
+  public_subnet_ids         = module.networking.public_subnet_ids
+  alb_security_group_ids    = [module.alb.security_group_id]
+  admin_cidr_blocks         = var.admin_cidr_blocks
+  instance_type             = var.instance_type
+  key_name                  = var.key_name
+  aws_region                = var.aws_region
+  iam_instance_profile_name = module.iam.instance_profile_name
 }
 
 # Database Module - RDS PostgreSQL
@@ -206,3 +212,15 @@ module "monitoring" {
   frontend_instance_id = module.compute.instance_id  # Same instance hosts both frontend and backend
 }
 
+# Target Group Attachments - Handle ALB target attachments separately to avoid circular dependency
+resource "aws_lb_target_group_attachment" "frontend_attachment" {
+  target_group_arn = module.alb.frontend_target_group_arn
+  target_id        = module.compute.instance_id
+  port             = 3000  # Adjust port as needed for your frontend
+}
+
+resource "aws_lb_target_group_attachment" "backend_attachment" {
+  target_group_arn = module.alb.backend_target_group_arn
+  target_id        = module.compute.instance_id
+  port             = 8000  # Adjust port as needed for your backend
+}

@@ -66,8 +66,9 @@ variable "private_subnets" {
 # COMPUTE VARIABLES
 ###############################################
 
-variable "backend_instance_type" {
-  description = "EC2 instance type for backend server"
+# Changed from backend_instance_type to instance_type to match your compute module
+variable "instance_type" {
+  description = "EC2 instance type for web application server"
   type        = string
   default     = "t3.micro"
   validation {
@@ -75,9 +76,16 @@ variable "backend_instance_type" {
       "t3.micro", "t3.small", "t3.medium", "t3.large",
       "t2.micro", "t2.small", "t2.medium", "t2.large",
       "m5.large", "m5.xlarge", "c5.large", "c5.xlarge"
-    ], var.backend_instance_type)
+    ], var.instance_type)
     error_message = "Instance type must be a valid EC2 instance type."
   }
+}
+
+# Keep the original for backward compatibility if needed elsewhere
+variable "backend_instance_type" {
+  description = "EC2 instance type for backend server (deprecated - use instance_type)"
+  type        = string
+  default     = null
 }
 
 variable "key_name" {
@@ -168,6 +176,22 @@ variable "db_backup_retention_period" {
 }
 
 ###############################################
+# STORAGE VARIABLES (ADDED)
+###############################################
+
+variable "artifacts_bucket_name" {
+  description = "S3 bucket name for deployment artifacts (optional)"
+  type        = string
+  default     = null
+}
+
+variable "create_artifacts_bucket" {
+  description = "Whether to create S3 bucket for artifacts"
+  type        = bool
+  default     = false
+}
+
+###############################################
 # CI/CD VARIABLES
 ###############################################
 
@@ -175,27 +199,30 @@ variable "webhook_secret" {
   description = "Secret for GitHub webhook validation"
   type        = string
   sensitive   = true
+  default     = ""
   validation {
-    condition     = length(var.webhook_secret) >= 8
-    error_message = "Webhook secret must be at least 8 characters long."
+    condition     = var.webhook_secret == "" || length(var.webhook_secret) >= 8
+    error_message = "Webhook secret must be at least 8 characters long or empty to disable."
   }
 }
 
 variable "github_owner" {
   description = "GitHub repository owner/organization"
   type        = string
+  default     = ""
   validation {
-    condition     = length(var.github_owner) > 0
-    error_message = "GitHub owner cannot be empty."
+    condition     = var.github_owner == "" || length(var.github_owner) > 0
+    error_message = "GitHub owner must be non-empty string or empty to disable CI/CD."
   }
 }
 
 variable "github_repo" {
   description = "GitHub repository name"
   type        = string
+  default     = ""
   validation {
-    condition     = length(var.github_repo) > 0
-    error_message = "GitHub repository name cannot be empty."
+    condition     = var.github_repo == "" || length(var.github_repo) > 0
+    error_message = "GitHub repository name must be non-empty string or empty to disable CI/CD."
   }
 }
 
@@ -213,10 +240,17 @@ variable "github_token" {
   description = "GitHub personal access token for repository access"
   type        = string
   sensitive   = true
+  default     = ""
   validation {
-    condition     = length(var.github_token) > 0
-    error_message = "GitHub token cannot be empty."
+    condition     = var.github_token == "" || length(var.github_token) > 0
+    error_message = "GitHub token must be non-empty string or empty to disable CI/CD."
   }
+}
+
+variable "enable_cicd" {
+  description = "Enable CI/CD pipeline components"
+  type        = bool
+  default     = false
 }
 
 ###############################################
@@ -239,6 +273,12 @@ variable "enable_encryption" {
   description = "Enable encryption at rest for database and storage"
   type        = bool
   default     = true
+}
+
+variable "enable_database" {
+  description = "Enable RDS database creation"
+  type        = bool
+  default     = false
 }
 
 ###############################################

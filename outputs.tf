@@ -54,6 +54,10 @@ output "security_group_id" {
   description = "ID of the EC2 security group"
 }
 
+output "web_app_public_ip" {
+  value = module.compute.instance_public_ip
+}
+
 ###############################################
 # LOAD BALANCER OUTPUTS
 ###############################################

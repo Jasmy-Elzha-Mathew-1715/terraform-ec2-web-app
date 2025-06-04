@@ -50,75 +50,6 @@ resource "aws_security_group" "web_app_sg" {
   }
 }
 
-# IAM role for EC2 instances
-resource "aws_iam_role" "ec2_role" {
-  name = "${var.project_name}-ec2-role"
-
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Action = "sts:AssumeRole"
-        Effect = "Allow"
-        Principal = {
-          Service = "ec2.amazonaws.com"
-        }
-      },
-    ]
-  })
-
-  tags = {
-    Name        = "${var.project_name}-ec2-role"
-    Environment = var.environment
-  }
-}
-
-# IAM profile for EC2 instances
-resource "aws_iam_instance_profile" "ec2_profile" {
-  name = "${var.project_name}-ec2-profile"
-  role = aws_iam_role.ec2_role.name
-}
-
-# IAM policy for EC2 to access S3 and other services
-resource "aws_iam_role_policy" "ec2_policy" {
-  name = "${var.project_name}-ec2-policy"
-  role = aws_iam_role.ec2_role.id
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Action = [
-          "s3:GetObject",
-          "s3:ListBucket",
-        ]
-        Effect   = "Allow"
-        Resource = [
-          var.artifacts_bucket_arn,
-          "${var.artifacts_bucket_arn}/*"
-        ]
-      },
-      {
-        Action = [
-          "secretsmanager:GetSecretValue",
-        ]
-        Effect   = "Allow"
-        Resource = var.db_secret_arn
-      },
-      {
-        Action = [
-          "cloudwatch:PutMetricData",
-          "logs:CreateLogGroup",
-          "logs:CreateLogStream",
-          "logs:PutLogEvents"
-        ]
-        Effect   = "Allow"
-        Resource = "*"
-      }
-    ]
-  })
-}
-
 # Single EC2 instance hosting both Node.js backend and Angular frontend
 resource "aws_instance" "web_app" {
   ami                    = "ami-0f88e80871fd81e91"
@@ -126,7 +57,7 @@ resource "aws_instance" "web_app" {
   subnet_id              = var.public_subnet_ids[0]
   vpc_security_group_ids = [aws_security_group.web_app_sg.id]
   key_name               = var.key_name
-  iam_instance_profile   = aws_iam_instance_profile.ec2_profile.name
+  iam_instance_profile   = var.iam_instance_profile_name != null ? var.iam_instance_profile_name : null
 
   user_data = <<-EOF
     #!/bin/bash
